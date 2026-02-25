@@ -1,0 +1,17 @@
+# Environment & secrets — never commit these
+.env
+.env.local
+*.pem
+*.key
+
+# pyenv virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store

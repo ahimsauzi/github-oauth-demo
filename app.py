@@ -6,38 +6,34 @@ Demonstrates the full Authorization Code Grant flow with:
   - PKCE (code_challenge / code_verifier) [shift-left security]
   - Authorization Code exchange for Access Token
   - Token introspection via GitHub /user endpoint
-  - Configurable scopes, code-expiry tracking, and simulated ID Token
+  - Live configuration via /config GUI (no restart required)
+  - Token revocation via DELETE /applications/{client_id}/token
 
-Usage:
+Design
+------
+State is managed through three single-instance classes defined near the top
+of this file. Each is self-contained and clearly marked as extractable to
+its own module when the project grows:
+
+  Config        — runtime settings (scopes, code_max_age, feature flags)
+  SessionStore  — in-flight PKCE sessions keyed by OAuth state token
+  TokenStore    — most recently issued access token (for revocation)
+
+Module-level singletons (cfg, session_store, token_store) are shared across
+all request handlers via module scope.
+
+Usage
+-----
   1. Copy .env.example to .env and fill in CLIENT_ID / CLIENT_SECRET
   2. pip install -r requirements.txt
   3. python app.py
-  4. Open http://127.0.0.1:8080 in your browser
+  4. Open http://127.0.0.1:8080
 
-────────────────────────────────────────────────────────────────────────────
-Optional configuration (all have safe defaults — nothing is required):
-
-  GITHUB_SCOPES
-      Space-separated GitHub OAuth scopes to request.
-      Default: "read:user user:email"
-      Example: "read:user user:email repo read:org"
-
-  CODE_MAX_AGE_SECONDS
-      How long (in seconds) your app will accept an authorization code
-      before treating it as expired on our side. GitHub's own hard limit
-      is 600 s (10 min); setting this lower adds a stricter local guard.
-      Default: 600  (matches GitHub's limit)
-      Example: 30   (very strict — useful for demo purposes)
-
-  SIMULATE_ID_TOKEN
-      Set to "true" to construct a synthetic ID Token (JWT-shaped JSON)
-      from the /user response, illustrating what a real OIDC ID Token
-      would look like. Clearly labelled as simulated in the UI.
-      NOTE: GitHub OAuth Apps do NOT issue real OIDC ID Tokens. The
-      'openid' scope is silently ignored by GitHub. For a real ID Token
-      use an OIDC-compliant provider (Google, Auth0, Okta, Keycloak).
-      Default: false
-────────────────────────────────────────────────────────────────────────────
+Optional env vars (all configurable live via /config):
+  GITHUB_SCOPES          Space-separated scopes   (default: "read:user user:email")
+  CODE_MAX_AGE_SECONDS   Local code expiry guard  (default: 600, max: 600)
+  SIMULATE_ID_TOKEN      Show simulated JWT        (default: false)
+  SHOW_RAW_JSON          Show raw /user JSON       (default: true)
 """
 
 import base64
@@ -64,36 +60,180 @@ CLIENT_ID     = os.environ.get("GITHUB_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
 REDIRECT_URI  = "http://127.0.0.1:8080/callback"
 
-# ── Optional configuration ────────────────────────────────────────────────
-
-# Scopes — space-separated list; extend freely with valid GitHub scopes.
-# ref: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps
-SCOPES = os.environ.get("GITHUB_SCOPES", "read:user user:email").strip()
-
-# Client-side code expiry guard (seconds). GitHub hard-expires codes at
-# 600 s. Set lower to demonstrate what happens when a code is too old.
-_raw_max_age = os.environ.get("CODE_MAX_AGE_SECONDS", "600")
-try:
-    CODE_MAX_AGE = max(1, int(_raw_max_age))
-except ValueError:
-    CODE_MAX_AGE = 600
-
-# Simulate an OIDC ID Token from the /user response.
-SIMULATE_ID_TOKEN = os.environ.get("SIMULATE_ID_TOKEN", "false").lower() == "true"
-
 # ── GitHub endpoints ──────────────────────────────────────────────────────
 AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 TOKEN_URL     = "https://github.com/login/oauth/access_token"
 USERINFO_URL  = "https://api.github.com/user"
 EMAILS_URL    = "https://api.github.com/user/emails"
-REVOKE_URL    = f"https://api.github.com/applications/{{}}/token"  # .format(CLIENT_ID)
 
-# ── Session store  {state: {verifier, challenge, issued_at}} ──────────────
-_sessions: dict[str, dict] = {}
 
-# ── Last issued access token (held in memory for revocation) ──────────────
-# Only the most recent token is stored — sufficient for a single-user demo.
-_last_token: dict[str, str] = {}   # keys: "access_token", "login"
+# ─────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────
+# Seeded from environment variables on startup.
+# All values are mutable at runtime via the /config GUI — no restart needed.
+# Extractable to config.py when the project grows into multiple modules.
+# ─────────────────────────────────────────────────────────────────────────
+
+class Config:
+    """
+    Runtime configuration for the OAuth demo app.
+
+    Attributes map 1-to-1 with environment variables and the /config form
+    fields. Adding a new setting requires:
+      1. A default in DEFAULTS
+      2. A line in __init__ to read from env
+      3. A line in update() to accept the new value
+      4. A field in the /config page template
+    """
+
+    DEFAULTS: dict = {
+        "scopes":            "read:user user:email",
+        "code_max_age":      600,
+        "simulate_id_token": False,
+        "show_raw_json":     True,
+    }
+
+    # ref: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps
+    KNOWN_SCOPES: list[tuple[str, str]] = [
+        ("read:user",     "Read public profile data"),
+        ("user",          "Read/write all profile data"),
+        ("user:email",    "Access email addresses"),
+        ("user:follow",   "Follow/unfollow users"),
+        ("repo",          "Full access to repositories"),
+        ("public_repo",   "Read/write public repositories"),
+        ("read:org",      "Read org membership & teams"),
+        ("admin:org",     "Full org admin access"),
+        ("gist",          "Create/edit gists"),
+        ("notifications", "Access notifications"),
+    ]
+
+    def __init__(self) -> None:
+        self.scopes            = os.environ.get("GITHUB_SCOPES",   self.DEFAULTS["scopes"]).strip()
+        self.code_max_age      = self._parse_max_age(os.environ.get("CODE_MAX_AGE_SECONDS", "600"))
+        self.simulate_id_token = os.environ.get("SIMULATE_ID_TOKEN", "false").lower() == "true"
+        self.show_raw_json     = os.environ.get("SHOW_RAW_JSON",   "true").lower()  != "false"
+
+    # ── Mutation ──────────────────────────────────────────────────────────
+
+    def update(self, *,
+               scopes: str | None            = None,
+               code_max_age: int | None      = None,
+               simulate_id_token: bool | None = None,
+               show_raw_json: bool | None     = None) -> None:
+        """Apply one or more setting changes. Unspecified values are unchanged."""
+        if scopes            is not None: self.scopes            = scopes.strip() or self.DEFAULTS["scopes"]
+        if code_max_age      is not None: self.code_max_age      = self._parse_max_age(str(code_max_age))
+        if simulate_id_token is not None: self.simulate_id_token = simulate_id_token
+        if show_raw_json     is not None: self.show_raw_json     = show_raw_json
+
+    def reset(self) -> None:
+        """Restore all settings to their compile-time defaults."""
+        self.scopes            = self.DEFAULTS["scopes"]
+        self.code_max_age      = self.DEFAULTS["code_max_age"]
+        self.simulate_id_token = self.DEFAULTS["simulate_id_token"]
+        self.show_raw_json     = self.DEFAULTS["show_raw_json"]
+
+    # ── Serialisation ─────────────────────────────────────────────────────
+
+    def as_dict(self) -> dict:
+        """Snapshot of current values — useful for logging and templates."""
+        return {
+            "scopes":            self.scopes,
+            "code_max_age":      self.code_max_age,
+            "simulate_id_token": self.simulate_id_token,
+            "show_raw_json":     self.show_raw_json,
+        }
+
+    def __repr__(self) -> str:
+        d = self.as_dict()
+        return (f"Config(scopes={d['scopes']!r}, code_max_age={d['code_max_age']}s, "
+                f"simulate_id_token={d['simulate_id_token']}, show_raw_json={d['show_raw_json']})")
+
+    # ── Private helpers ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_max_age(raw: str) -> int:
+        try:
+            return max(1, min(600, int(raw)))
+        except ValueError:
+            return 600
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SessionStore
+# ─────────────────────────────────────────────────────────────────────────
+# Holds in-flight PKCE sessions keyed by the OAuth state parameter.
+# Each entry lives only for the duration of a single authorization round-trip
+# and is consumed (popped) at /callback.
+# Extractable to session.py when the project grows.
+# ─────────────────────────────────────────────────────────────────────────
+
+class SessionStore:
+    """PKCE session state for in-flight authorization requests."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, dict] = {}
+
+    def create(self, state: str, verifier: str, challenge: str) -> None:
+        """Record a new session keyed by state token."""
+        self._store[state] = {
+            "verifier":  verifier,
+            "challenge": challenge,
+            "issued_at": time.monotonic(),
+        }
+
+    def consume(self, state: str) -> dict | None:
+        """Return and remove the session for state, or None if not found."""
+        return self._store.pop(state, None)
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# TokenStore
+# ─────────────────────────────────────────────────────────────────────────
+# Holds the most recently issued access token in memory so the Revoke
+# button always has something to act on.
+# Single-user demo scope — one token at a time is sufficient.
+# Extractable to token_store.py when the project grows.
+# ─────────────────────────────────────────────────────────────────────────
+
+class TokenStore:
+    """In-memory store for the most recently issued access token."""
+
+    def __init__(self) -> None:
+        self._token: str = ""
+        self._login: str = ""
+
+    def save(self, access_token: str, login: str) -> None:
+        self._token = access_token
+        self._login = login
+
+    def clear(self) -> None:
+        self._token = ""
+        self._login = ""
+
+    @property
+    def token(self) -> str:
+        return self._token
+
+    @property
+    def login(self) -> str:
+        return self._login
+
+    @property
+    def has_token(self) -> bool:
+        return bool(self._token)
+
+
+# ── Module-level singletons ───────────────────────────────────────────────
+# One instance each — shared across all request handlers via module scope.
+
+cfg           = Config()
+session_store = SessionStore()
+token_store   = TokenStore()
 
 # ── PKCE helpers ──────────────────────────────────────────────────────────
 
@@ -241,14 +381,56 @@ _CSS = """
              color:#3b7dd8;font-size:0.68rem;font-family:monospace;padding:0.1rem 0.5rem;
              border-radius:3px;text-transform:uppercase;letter-spacing:0.06em;
              vertical-align:middle;margin-left:0.4rem}
+  /* ── Nav bar ── */
+  .nav{display:flex;gap:0.5rem;align-items:center;margin-bottom:2rem;
+       padding-bottom:1rem;border-bottom:1px solid #252d3d;flex-wrap:wrap}
+  .nav-link{display:inline-block;padding:0.35rem 0.9rem;border:1px solid #252d3d;
+            border-radius:5px;color:#7a8298;text-decoration:none;font-size:0.82rem;
+            font-family:monospace;transition:all 0.15s}
+  .nav-link:hover{border-color:#00d4aa;color:#00d4aa}
+  .nav-link.active{border-color:#00d4aa;color:#00d4aa;background:rgba(0,212,170,0.08)}
+  .nav-sep{color:#252d3d;font-size:1.2rem;user-select:none}
+  /* ── Config form ── */
+  .cfg-form label{display:block;font-family:monospace;font-size:0.72rem;color:#7a8298;
+                  letter-spacing:0.07em;text-transform:uppercase;margin-bottom:0.35rem}
+  .cfg-form input[type=text],.cfg-form input[type=number]{
+    width:100%;background:#0d0f14;border:1px solid #252d3d;color:#e8eaf0;
+    padding:0.55rem 0.9rem;border-radius:6px;font-family:monospace;font-size:0.88rem;
+    outline:none;box-sizing:border-box;transition:border-color 0.15s}
+  .cfg-form input:focus{border-color:#00d4aa}
+  .cfg-form .field{margin-bottom:1.2rem}
+  .cfg-form .hint{font-size:0.75rem;color:#4a5268;margin-top:0.3rem;font-family:monospace}
+  .cfg-form .toggle-row{display:flex;align-items:center;gap:0.8rem}
+  .toggle{position:relative;width:44px;height:24px;flex-shrink:0}
+  .toggle input{opacity:0;width:0;height:0}
+  .toggle-slider{position:absolute;inset:0;background:#252d3d;border-radius:24px;
+                 cursor:pointer;transition:0.2s}
+  .toggle-slider:before{content:'';position:absolute;width:18px;height:18px;
+                         left:3px;top:3px;background:#7a8298;border-radius:50%;transition:0.2s}
+  .toggle input:checked + .toggle-slider{background:rgba(0,212,170,0.25);
+                                          border:1px solid #00d4aa}
+  .toggle input:checked + .toggle-slider:before{transform:translateX(20px);background:#00d4aa}
+  .cfg-saved{background:rgba(0,212,170,0.1);border:1px solid #00d4aa;border-radius:6px;
+             padding:0.7rem 1rem;color:#00d4aa;font-family:monospace;font-size:0.82rem;
+             margin-bottom:1rem;display:none}
+  .cfg-saved.show{display:block}
 </style>
 """
 
 
-def _page(title: str, body: str) -> str:
+def _nav(active: str = "") -> str:
+    links = [("home", "/", "Home"), ("config", "/config", "⚙ Config")]
+    items = ""
+    for key, href, label in links:
+        cls = ' class="nav-link active"' if key == active else ' class="nav-link"'
+        items += f'<a{cls} href="{href}">{label}</a>'
+    return f'<div class="nav">{items}</div>'
+
+
+def _page(title: str, body: str, active_nav: str = "home") -> str:
     return (f'<!DOCTYPE html><html lang="en"><head>\n'
             f'<meta charset="UTF-8"><title>{title}</title>{_CSS}</head>\n'
-            f'<body>{body}</body></html>')
+            f'<body>{_nav(active_nav)}{body}</body></html>')
 
 # ── Home page ─────────────────────────────────────────────────────────────
 
@@ -258,20 +440,20 @@ def _home_page() -> str:
         if CLIENT_ID else
         '<p class="err">⚠ GITHUB_CLIENT_ID not set — edit your .env file and restart.</p>'
     )
-    scope_list    = " ".join(f"<code>{html.escape(s)}</code>" for s in SCOPES.split())
+    scope_list    = " ".join(f"<code>{html.escape(s)}</code>" for s in cfg.scopes.split())
     code_age_note = (
-        f'<span class="ok">{CODE_MAX_AGE} s</span> '
-        f'{"(matches GitHub hard limit)" if CODE_MAX_AGE == 600 else "(stricter than GitHub — good for demos)"}'
+        f'<span class="ok">{cfg.code_max_age} s</span> '
+        f'{"(matches GitHub hard limit)" if cfg.code_max_age == 600 else "(stricter than GitHub — good for demos)"}'
     )
     id_token_note = (
         '<span class="ok">enabled</span> — simulated JWT shown after auth'
-        if SIMULATE_ID_TOKEN else
-        '<span class="warn">disabled</span> — set <code>SIMULATE_ID_TOKEN=true</code> to enable'
+        if cfg.simulate_id_token else
+        '<span class="warn">disabled</span> — set <code>cfg.simulate_id_token=true</code> to enable'
     )
 
     # Revoke button — only shown when a token is held in memory
-    if _last_token:
-        login        = html.escape(_last_token.get("login", "unknown"))
+    if token_store.has_token:
+        login        = html.escape(token_store.login)
         revoke_block = f"""
 <form method="POST" action="/revoke" style="display:inline">
   <button class="btn btn-danger" type="submit"
@@ -310,7 +492,15 @@ def _home_page() -> str:
       <td>{id_token_note}</td>
       <td><code>SIMULATE_ID_TOKEN</code></td>
     </tr>
+    <tr>
+      <td>Show raw /user JSON</td>
+      <td>{'<span class="ok">enabled</span>' if cfg.show_raw_json else '<span class="warn">disabled</span>'}</td>
+      <td><code>SHOW_RAW_JSON</code></td>
+    </tr>
   </table>
+  <p style="margin-top:0.8rem;font-size:0.78rem">
+    <a href="/config">⚙ Change configuration →</a>
+  </p>
 </div>
 
 <div class="card">
@@ -328,7 +518,7 @@ def _home_page() -> str:
     using the <code>code_verifier</code> (PKCE) and <code>client_secret</code>.</div>
   <div class="step">⑤ The Access Token calls <code>/user</code> and <code>/user/emails</code>
     on the GitHub Resource Server — the OIDC UserInfo equivalent.</div>
-  {"<div class='step'>⑥ A <strong>simulated ID Token JWT</strong> is constructed from the /user response to illustrate OIDC structure. Clearly labelled — not cryptographically valid.</div>" if SIMULATE_ID_TOKEN else ""}
+  {"<div class='step'>⑥ A <strong>simulated ID Token JWT</strong> is constructed from the /user response to illustrate OIDC structure. Clearly labelled — not cryptographically valid.</div>" if cfg.simulate_id_token else ""}
   <div class="step{'last'}"
     style="border-left-color:#e05c5c;background:#1e1014">
     <strong>Revoke Token</strong> — calls
@@ -376,7 +566,7 @@ def _callback_page(
     verified      = next((e["verified"] for e in emails if e.get("primary")), False)
 
     # Scope comparison — requested vs granted
-    requested  = set(SCOPES.split())
+    requested  = set(cfg.scopes.split())
     granted    = {s.strip() for s in scope.split(",") if s.strip()}
     all_scopes = sorted(requested | granted)
     scope_rows = ""
@@ -389,24 +579,24 @@ def _callback_page(
         scope_rows += f"<tr><td><code>{html.escape(s)}</code></td><td>{in_req}</td><td>{in_gnt}</td></tr>"
 
     # Code age display
-    age_colour = "ok" if code_age <= CODE_MAX_AGE else "err"
+    age_colour = "ok" if code_age <= cfg.code_max_age else "err"
     age_label  = f'<span class="{age_colour}">{code_age:.1f} s</span>'
     if code_expired_locally:
         age_banner = (
             f'<p class="err">⚠ Code age ({code_age:.1f} s) exceeded CODE_MAX_AGE_SECONDS '
-            f'({CODE_MAX_AGE} s). In production this request would be rejected before the '
+            f'({cfg.code_max_age} s). In production this request would be rejected before the '
             f'exchange attempt. The exchange was attempted here to demonstrate GitHub\'s '
             f'own 600 s hard limit separately.</p>'
         )
     else:
         age_banner = (
-            f'<p class="ok">✓ Code age {age_label} is within the {CODE_MAX_AGE} s '
+            f'<p class="ok">✓ Code age {age_label} is within the {cfg.code_max_age} s '
             f'local limit (GitHub hard limit: 600 s).</p>'
         )
 
     # Simulated ID Token section
     id_token_html = ""
-    if SIMULATE_ID_TOKEN:
+    if cfg.simulate_id_token:
         sim        = build_simulated_id_token(user, primary_email, verified)
         claim_rows = "".join(
             f"<tr><td><code>{html.escape(k)}</code></td>"
@@ -442,12 +632,12 @@ def _callback_page(
   </p>
 </div>"""
 
-    step_offset   = 1 if SIMULATE_ID_TOKEN else 0
-    user_step     = f"⑥" if not SIMULATE_ID_TOKEN else "⑦"
-    compare_step  = f"⑦" if not SIMULATE_ID_TOKEN else "⑧"
+    step_offset   = 1 if cfg.simulate_id_token else 0
+    user_step     = f"⑥" if not cfg.simulate_id_token else "⑦"
+    compare_step  = f"⑦" if not cfg.simulate_id_token else "⑧"
     id_token_row  = (
         '<span class="warn">✗ Not issued — simulated above</span>'
-        if SIMULATE_ID_TOKEN else
+        if cfg.simulate_id_token else
         '<span class="err">✗ Not issued</span>'
     )
 
@@ -463,7 +653,7 @@ def _callback_page(
     <tr><th>Parameter</th><th>Value</th><th>Purpose</th></tr>
     <tr><td>client_id</td><td><code>{html.escape(CLIENT_ID)}</code></td>
         <td>Identifies your app</td></tr>
-    <tr><td>scope</td><td><code>{html.escape(SCOPES)}</code></td>
+    <tr><td>scope</td><td><code>{html.escape(cfg.scopes)}</code></td>
         <td>Permissions requested (from <code>GITHUB_SCOPES</code>)</td></tr>
     <tr><td>state</td><td><code>{html.escape(state[:16])}…</code></td>
         <td>CSRF token — one-time random value</td></tr>
@@ -488,7 +678,7 @@ def _callback_page(
     </tr>
     <tr>
       <td>Local app guard</td>
-      <td><span class="{'ok' if CODE_MAX_AGE <= 600 else 'warn'}">{CODE_MAX_AGE} s</span></td>
+      <td><span class="{'ok' if cfg.code_max_age <= 600 else 'warn'}">{cfg.code_max_age} s</span></td>
       <td><code>CODE_MAX_AGE_SECONDS</code> env var</td>
     </tr>
     <tr>
@@ -569,8 +759,7 @@ def _callback_page(
         <td><code>{html.escape((user.get('avatar_url') or '')[:55])}…</code></td>
         <td><code>picture</code></td></tr>
   </table>
-  <h2>Raw /user JSON</h2>
-  <pre>{_j(user)}</pre>
+  {"<h2>Raw /user JSON</h2><pre>" + _j(user) + "</pre>" if cfg.show_raw_json else ""}
 </div>
 
 <!-- ── OAuth vs OIDC comparison ── -->
@@ -658,6 +847,139 @@ def _revoke_result_page(success: bool, message: str, login: str) -> str:
 """)
 
 
+# ── Config page ───────────────────────────────────────────────────────────
+
+# All known GitHub OAuth scopes for the multi-select helper
+Config.KNOWN_SCOPES = [
+    ("read:user",   "Read public profile data"),
+    ("user",        "Read/write all profile data"),
+    ("user:email",  "Access email addresses"),
+    ("user:follow", "Follow/unfollow users"),
+    ("repo",        "Full access to repositories"),
+    ("public_repo", "Read/write public repositories"),
+    ("read:org",    "Read org membership & teams"),
+    ("admin:org",   "Full org admin access"),
+    ("gist",        "Create/edit gists"),
+    ("notifications", "Access notifications"),
+]
+
+def _config_page(saved: bool = False, reset: bool = False) -> str:
+    active_scopes = set(cfg.scopes.split())
+
+    scope_checkboxes = ""
+    for scope, desc in Config.KNOWN_SCOPES:
+        checked = "checked" if scope in active_scopes else ""
+        scope_checkboxes += f"""
+      <label style="display:flex;align-items:center;gap:0.6rem;padding:0.3rem 0;
+                    cursor:pointer;font-size:0.85rem;font-family:monospace">
+        <input type="checkbox" name="scope" value="{scope}" {checked}
+               style="accent-color:#00d4aa;width:15px;height:15px">
+        <span><code style="color:#00d4aa">{scope}</code>
+          <span style="color:#4a5268;font-size:0.75rem"> — {desc}</span>
+        </span>
+      </label>"""
+
+    if reset:
+        saved_banner = '<div class="cfg-saved show">↺ Configuration reset to defaults.</div>'
+    elif saved:
+        saved_banner = '<div class="cfg-saved show">✓ Configuration saved — takes effect on the next OAuth flow.</div>'
+    else:
+        saved_banner = ''
+
+    sim_checked   = "checked" if cfg.simulate_id_token else ""
+    json_checked  = "checked" if cfg.show_raw_json else ""
+
+    return _page("Configuration", f"""
+<h1>Configuration</h1>
+<p class="label">Changes take effect immediately — no restart required. Reset to defaults by restarting the server.</p>
+
+{saved_banner}
+
+<form class="cfg-form" method="POST" action="/config">
+
+  <!-- ── Scopes ── -->
+  <div class="card">
+    <h2>OAuth Scopes</h2>
+    <p style="font-size:0.82rem;color:#7a8298;margin-bottom:1rem">
+      Select the scopes to request from GitHub. The user will be asked to grant
+      these on the consent screen. GitHub may grant fewer than requested.
+      <a href="https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps"
+         target="_blank" style="font-size:0.75rem">Full scope reference ↗</a>
+    </p>
+    {scope_checkboxes}
+    <div class="field" style="margin-top:1rem">
+      <label>Custom / additional scopes</label>
+      <input type="text" name="custom_scopes"
+             placeholder="e.g. workflow delete_repo  (space-separated)"
+             value="">
+      <div class="hint">Added on top of the checked scopes above.</div>
+    </div>
+  </div>
+
+  <!-- ── Code expiry ── -->
+  <div class="card">
+    <h2>Authorization Code Max Age</h2>
+    <div class="field">
+      <label>Max age (seconds)</label>
+      <input type="number" name="code_max_age" min="1" max="600"
+             value="{cfg.code_max_age}">
+      <div class="hint">
+        GitHub hard-expires codes after <strong>600 s (10 min)</strong> — this cannot be changed.
+        Set a lower value here to add a stricter local guard and observe the behaviour.
+        Recommended: <code>30</code> for demos, <code>600</code> for normal use.
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Display toggles ── -->
+  <div class="card">
+    <h2>Display Options</h2>
+
+    <div class="field">
+      <div class="toggle-row">
+        <label class="toggle">
+          <input type="checkbox" name="simulate_id_token" {sim_checked}>
+          <span class="toggle-slider"></span>
+        </label>
+        <div>
+          <div style="font-size:0.88rem">Simulate ID Token</div>
+          <div class="hint">Construct a JWT-shaped simulated OIDC ID Token from the
+          <code>/user</code> response after auth. Clearly labelled as not valid.
+          Useful for explaining what a real ID Token looks like.
+          <br><em>Note: GitHub OAuth Apps do not issue real ID Tokens.</em></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="field" style="margin-top:1.2rem">
+      <div class="toggle-row">
+        <label class="toggle">
+          <input type="checkbox" name="show_raw_json" {json_checked}>
+          <span class="toggle-slider"></span>
+        </label>
+        <div>
+          <div style="font-size:0.88rem">Show Raw /user JSON</div>
+          <div class="hint">Display the full raw JSON response from the GitHub
+          <code>/user</code> endpoint on the results page. Disable to keep the
+          results page cleaner during a live demo.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Actions ── -->
+  <div style="display:flex;gap:1rem;align-items:center;margin-top:0.5rem">
+    <button class="btn" type="submit" name="action" value="save">Save Configuration</button>
+    <button class="btn" type="submit" name="action" value="reset"
+            style="background:none;border-color:#e0b55c;color:#e0b55c"
+            onclick="return confirm('Reset all settings to defaults?')">Reset to Defaults</button>
+    <a class="btn" href="/" style="background:none;border-color:#252d3d;color:#7a8298">Cancel</a>
+  </div>
+
+</form>
+""", active_nav="config")
+
+
 # ── Request handler ───────────────────────────────────────────────────────
 
 class OAuthHandler(BaseHTTPRequestHandler):
@@ -692,6 +1014,8 @@ class OAuthHandler(BaseHTTPRequestHandler):
             self._handle_login()
         elif path == "/callback":
             self._handle_callback(params)
+        elif path == "/config":
+            self._send_html(_config_page())
         else:
             self._send_html("<h1>404</h1>", 404)
 
@@ -699,11 +1023,43 @@ class OAuthHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/revoke":
             self._handle_revoke()
+        elif parsed.path == "/config":
+            self._handle_config()
         else:
             self._send_html("<h1>404</h1>", 404)
 
+    def _handle_config(self):
+        length  = int(self.headers.get("Content-Length", 0))
+        raw     = self.rfile.read(length).decode()
+        params  = urllib.parse.parse_qs(raw, keep_blank_values=True)
+
+        # ── Reset to defaults shortcut ────────────────────────────────────
+        if params.get("action", ["save"])[0] == "reset":
+            cfg.reset()
+            print(f"[⚙] Config reset to defaults: {cfg!r}")
+            self._send_html(_config_page(saved=True, reset=True))
+            return
+
+        # ── Scopes — merge checkboxes + custom field ──────────────────────
+        checked = params.get("scope", [])
+        custom  = params.get("custom_scopes", [""])[0].strip()
+        extra   = [s for s in custom.split() if s]
+        merged  = " ".join(dict.fromkeys(checked + extra)) or Config.DEFAULTS["scopes"]
+
+        # ── Apply all changes via cfg.update() ────────────────────────────
+        cfg.update(
+            scopes            = merged,
+            code_max_age      = int(params.get("code_max_age", ["600"])[0]),
+            simulate_id_token = "simulate_id_token" in params,
+            show_raw_json     = "show_raw_json"     in params,
+        )
+
+        print(f"[⚙] {cfg!r}")
+
+        self._send_html(_config_page(saved=True))
+
     def _handle_revoke(self):
-        if not _last_token:
+        if not token_store.has_token:
             self._send_html(_revoke_result_page(
                 success=False,
                 message="No token held in memory. Complete an OAuth flow first.",
@@ -711,8 +1067,8 @@ class OAuthHandler(BaseHTTPRequestHandler):
             ))
             return
 
-        token = _last_token.get("access_token", "")
-        login = _last_token.get("login", "")
+        token = token_store.token
+        login = token_store.login
         url   = f"https://api.github.com/applications/{CLIENT_ID}/token"
 
         print(f"[✕] Revoking token for {login}…")
@@ -720,7 +1076,7 @@ class OAuthHandler(BaseHTTPRequestHandler):
 
         if status == 204:
             # Success — clear the in-memory store
-            _last_token.clear()
+            token_store.clear()
             print(f"[✓] Token revoked (HTTP {status}). Next auth will show consent screen.")
             self._send_html(_revoke_result_page(
                 success=True,
@@ -740,18 +1096,14 @@ class OAuthHandler(BaseHTTPRequestHandler):
             self._send_html('<p style="color:red">Set GITHUB_CLIENT_ID in .env</p>', 500)
             return
 
-        state              = secrets.token_urlsafe(24)
+        state               = secrets.token_urlsafe(24)
         verifier, challenge = generate_pkce_pair()
-        _sessions[state]   = {
-            "verifier":  verifier,
-            "challenge": challenge,
-            "issued_at": time.monotonic(),  # recorded for code-age tracking
-        }
+        session_store.create(state, verifier, challenge)
 
         params = {
             "client_id":             CLIENT_ID,
             "redirect_uri":          REDIRECT_URI,
-            "scope":                 SCOPES,
+            "scope":                 cfg.scopes,
             "state":                 state,
             "code_challenge":        challenge,
             "code_challenge_method": "S256",
@@ -763,7 +1115,7 @@ class OAuthHandler(BaseHTTPRequestHandler):
     def _handle_callback(self, params: dict):
         # ── CSRF check ────────────────────────────────────────────────────
         state   = params.get("state", "")
-        session = _sessions.pop(state, None)
+        session = session_store.consume(state)
         if not session:
             self._send_html(
                 '<p style="color:#e05c5c">Invalid or missing state — possible CSRF attack.</p>',
@@ -787,10 +1139,10 @@ class OAuthHandler(BaseHTTPRequestHandler):
 
         # ── Code age check ────────────────────────────────────────────────
         code_age             = time.monotonic() - session["issued_at"]
-        code_expired_locally = code_age > CODE_MAX_AGE
+        code_expired_locally = code_age > cfg.code_max_age
         if code_expired_locally:
             print(
-                f"[⚠] Code age {code_age:.1f} s exceeds CODE_MAX_AGE_SECONDS={CODE_MAX_AGE} — "
+                f"[⚠] Code age {code_age:.1f} s exceeds CODE_MAX_AGE_SECONDS={cfg.code_max_age} — "
                 f"proceeding to demonstrate GitHub's own 600 s limit"
             )
 
@@ -798,7 +1150,7 @@ class OAuthHandler(BaseHTTPRequestHandler):
         auth_url = AUTHORIZE_URL + "?" + urllib.parse.urlencode({
             "client_id":             CLIENT_ID,
             "redirect_uri":          REDIRECT_URI,
-            "scope":                 SCOPES,
+            "scope":                 cfg.scopes,
             "state":                 state,
             "code_challenge":        challenge,
             "code_challenge_method": "S256",
@@ -845,8 +1197,7 @@ class OAuthHandler(BaseHTTPRequestHandler):
         print(f"[✓] Authenticated as: {user.get('login')}  (code age: {code_age:.1f} s)")
 
         # Store token in memory so the home page Revoke button can use it
-        _last_token["access_token"] = access_token
-        _last_token["login"]        = user.get("login", "")
+        token_store.save(access_token, user.get("login", ""))
 
         self._send_html(_callback_page(
             auth_code, state, token_resp, user, emails,
@@ -865,9 +1216,9 @@ if __name__ == "__main__":
     else:
         print(f"✓  Client ID:          {CLIENT_ID[:8]}…")
 
-    print(f"   Scopes:            {SCOPES}")
-    print(f"   Code max age:      {CODE_MAX_AGE} s  (GitHub hard limit: 600 s)")
-    print(f"   Simulate ID Token: {SIMULATE_ID_TOKEN}")
+    print(f"   Scopes:            {cfg.scopes}")
+    print(f"   Code max age:      {cfg.code_max_age} s  (GitHub hard limit: 600 s)")
+    print(f"   Simulate ID Token: {cfg.simulate_id_token}")
     print(f"\n🚀  http://127.0.0.1:{port}")
     print(f"    Callback: {REDIRECT_URI}")
     print("──────────────────────────────────────────────────────────\n")
