@@ -789,7 +789,48 @@ def _callback_page(
     <tr><td><code>openid</code> scope</td>
         <td class="err">✗ Silently ignored by GitHub</td>
         <td class="ok">✓ Triggers ID Token issuance</td></tr>
+    <tr>
+      <td><code>prompt=consent</code></td>
+      <td class="err">✗ Not supported — GitHub suppresses the consent
+          screen after first authorization, even after token revocation,
+          if the same scopes are re-requested in the same browser session</td>
+      <td class="ok">✓ Forces consent screen on every flow regardless
+          of prior grants — required for step-up auth and re-authorization
+          UX patterns</td>
+    </tr>
   </table>
+
+  <!-- ── prompt=consent callout ── -->
+  <div style="margin-top:1.2rem;padding:1rem 1.2rem;border-radius:8px;
+              background:#0f1a2b;border:1px solid #3b7dd8">
+    <div style="font-family:monospace;font-size:0.72rem;color:#3b7dd8;
+                letter-spacing:0.08em;text-transform:uppercase;margin-bottom:0.6rem">
+      ⓘ Why Revoke didn't show a consent screen
+    </div>
+    <p style="font-size:0.85rem;line-height:1.65;margin:0 0 0.6rem">
+      The revocation above succeeded — GitHub returned <code>204 No Content</code>
+      and the grant was destroyed. However, because GitHub OAuth Apps don't support
+      the <code>prompt=consent</code> parameter, GitHub silently re-authorized the
+      app when the same scopes were re-requested in the same browser session.
+    </p>
+    <p style="font-size:0.85rem;line-height:1.65;margin:0 0 0.6rem">
+      <strong style="color:#e8eaf0">To trigger the consent screen manually:</strong>
+      go to
+      <a href="https://github.com/settings/applications" target="_blank">
+        GitHub → Settings → Authorized OAuth Apps
+      </a>
+      and revoke the app there, then run the flow again.
+      Alternatively, request a <em>new scope</em> the app hasn't been granted before —
+      GitHub must show the screen when new permissions are needed.
+    </p>
+    <p style="font-size:0.85rem;line-height:1.65;margin:0">
+      <strong style="color:#e8eaf0">OIDC providers solve this properly.</strong>
+      Platforms like PingOne, Okta, Auth0, and Google Identity support
+      <code>prompt=consent</code> (and <code>prompt=login</code>,
+      <code>prompt=select_account</code>), giving applications explicit control
+      over the authentication UX on every request — no workarounds needed.
+    </p>
+  </div>
 </div>
 
 <br>
@@ -812,8 +853,13 @@ def _revoke_result_page(success: bool, message: str, login: str) -> str:
     heading = "Token Revoked" if success else "Revocation Failed"
     next_step = (
         '<p>The stored grant has been deleted from GitHub. '
-        'Click <strong>Start OAuth Flow</strong> to run a fresh authorization — '
-        'GitHub will present the consent screen again.</p>'
+        'Click <strong>Start OAuth Flow</strong> to run a fresh authorization.<br>'
+        '<span class="warn">⚠ Note:</span> GitHub OAuth Apps do not support '
+        '<code>prompt=consent</code>, so GitHub may silently re-authorize if '
+        'the same scopes are re-requested in the same browser session. '
+        'To force the consent screen, request a new scope or revoke the app directly in '
+        '<a href="https://github.com/settings/applications" target="_blank">'
+        'GitHub → Settings → Authorized OAuth Apps</a>.</p>'
         if success else
         '<p>The token in memory has been left unchanged. '
         'Try running the flow again to obtain a fresh token, then retry revocation.</p>'
