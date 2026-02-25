@@ -1,0 +1,3 @@
+# Only one optional dependency — python-dotenv for .env file loading
+# The rest of the app uses the Python standard library only
+python-dotenv>=1.0.0
