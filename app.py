@@ -18,6 +18,8 @@ its own module when the project grows:
   Config        — runtime settings (scopes, code_max_age, feature flags)
   SessionStore  — in-flight PKCE sessions keyed by OAuth state token
   TokenStore    — most recently issued access token (for revocation)
+  FlowStore     — intermediate state between step-through pause points
+  StepRenderer  — HTML renderers for the four step-through pause pages
 
 Module-level singletons (cfg, session_store, token_store) are shared across
 all request handlers via module scope.
@@ -34,6 +36,7 @@ Optional env vars (all configurable live via /config):
   CODE_MAX_AGE_SECONDS   Local code expiry guard  (default: 600, max: 600)
   SIMULATE_ID_TOKEN      Show simulated JWT        (default: false)
   SHOW_RAW_JSON          Show raw /user JSON       (default: true)
+  STEP_THROUGH           Pause at each flow stage  (default: false)
 """
 
 import base64
@@ -92,6 +95,7 @@ class Config:
         "code_max_age":      600,
         "simulate_id_token": False,
         "show_raw_json":     True,
+        "step_through":      False,
     }
 
     # ref: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps
@@ -113,19 +117,22 @@ class Config:
         self.code_max_age      = self._parse_max_age(os.environ.get("CODE_MAX_AGE_SECONDS", "600"))
         self.simulate_id_token = os.environ.get("SIMULATE_ID_TOKEN", "false").lower() == "true"
         self.show_raw_json     = os.environ.get("SHOW_RAW_JSON",   "true").lower()  != "false"
+        self.step_through      = os.environ.get("STEP_THROUGH",    "false").lower() == "true"
 
     # ── Mutation ──────────────────────────────────────────────────────────
 
     def update(self, *,
-               scopes: str | None            = None,
-               code_max_age: int | None      = None,
+               scopes: str | None             = None,
+               code_max_age: int | None       = None,
                simulate_id_token: bool | None = None,
-               show_raw_json: bool | None     = None) -> None:
+               show_raw_json: bool | None     = None,
+               step_through: bool | None      = None) -> None:
         """Apply one or more setting changes. Unspecified values are unchanged."""
         if scopes            is not None: self.scopes            = scopes.strip() or self.DEFAULTS["scopes"]
         if code_max_age      is not None: self.code_max_age      = self._parse_max_age(str(code_max_age))
         if simulate_id_token is not None: self.simulate_id_token = simulate_id_token
         if show_raw_json     is not None: self.show_raw_json     = show_raw_json
+        if step_through      is not None: self.step_through      = step_through
 
     def reset(self) -> None:
         """Restore all settings to their compile-time defaults."""
@@ -133,8 +140,7 @@ class Config:
         self.code_max_age      = self.DEFAULTS["code_max_age"]
         self.simulate_id_token = self.DEFAULTS["simulate_id_token"]
         self.show_raw_json     = self.DEFAULTS["show_raw_json"]
-
-    # ── Serialisation ─────────────────────────────────────────────────────
+        self.step_through      = self.DEFAULTS["step_through"]
 
     def as_dict(self) -> dict:
         """Snapshot of current values — useful for logging and templates."""
@@ -143,12 +149,14 @@ class Config:
             "code_max_age":      self.code_max_age,
             "simulate_id_token": self.simulate_id_token,
             "show_raw_json":     self.show_raw_json,
+            "step_through":      self.step_through,
         }
 
     def __repr__(self) -> str:
         d = self.as_dict()
         return (f"Config(scopes={d['scopes']!r}, code_max_age={d['code_max_age']}s, "
-                f"simulate_id_token={d['simulate_id_token']}, show_raw_json={d['show_raw_json']})")
+                f"simulate_id_token={d['simulate_id_token']}, show_raw_json={d['show_raw_json']}, "
+                f"step_through={d['step_through']})")
 
     # ── Private helpers ───────────────────────────────────────────────────
 
@@ -182,6 +190,10 @@ class SessionStore:
             "challenge": challenge,
             "issued_at": time.monotonic(),
         }
+
+    def peek(self, state: str) -> dict | None:
+        """Return session data without removing it (used by step-through mode)."""
+        return self._store.get(state)
 
     def consume(self, state: str) -> dict | None:
         """Return and remove the session for state, or None if not found."""
@@ -234,6 +246,435 @@ class TokenStore:
 cfg           = Config()
 session_store = SessionStore()
 token_store   = TokenStore()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FlowStore
+# ─────────────────────────────────────────────────────────────────────────
+# Holds intermediate state between step-through pause points.
+# In normal (non-step-through) mode this is never written to.
+# Extractable to flow_store.py when the project grows.
+# ─────────────────────────────────────────────────────────────────────────
+
+class FlowStore:
+    """
+    Carries in-progress OAuth flow data between step-through pause pages.
+
+    Lifecycle:
+      start()        called at /login when step_through is enabled
+      save_callback() called when GitHub returns to /callback
+      save_token()   called after token exchange succeeds
+      clear()        called after the final results page is shown
+    """
+
+    def __init__(self) -> None:
+        self._data: dict = {}
+
+    def start(self, state: str, verifier: str, challenge: str, auth_url: str,
+              auth_params: dict) -> None:
+        self._data = {
+            "state":       state,
+            "verifier":    verifier,
+            "challenge":   challenge,
+            "auth_url":    auth_url,
+            "auth_params": auth_params,
+            "started_at":  time.monotonic(),
+        }
+
+    def save_callback(self, auth_code: str, code_age: float,
+                      code_expired_locally: bool) -> None:
+        self._data.update({
+            "auth_code":            auth_code,
+            "code_age":             code_age,
+            "code_expired_locally": code_expired_locally,
+        })
+
+    def save_token(self, token_resp: dict) -> None:
+        self._data["token_resp"] = token_resp
+
+    def clear(self) -> None:
+        self._data = {}
+
+    @property
+    def active(self) -> bool:
+        return bool(self._data)
+
+    @property
+    def state(self) -> str:
+        return self._data.get("state", "")
+
+    @property
+    def verifier(self) -> str:
+        return self._data.get("verifier", "")
+
+    @property
+    def challenge(self) -> str:
+        return self._data.get("challenge", "")
+
+    @property
+    def auth_url(self) -> str:
+        return self._data.get("auth_url", "")
+
+    @property
+    def auth_params(self) -> dict:
+        return self._data.get("auth_params", {})
+
+    @property
+    def auth_code(self) -> str:
+        return self._data.get("auth_code", "")
+
+    @property
+    def code_age(self) -> float:
+        return self._data.get("code_age", 0.0)
+
+    @property
+    def code_expired_locally(self) -> bool:
+        return self._data.get("code_expired_locally", False)
+
+    @property
+    def token_resp(self) -> dict:
+        return self._data.get("token_resp", {})
+
+
+flow_store = FlowStore()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# StepRenderer
+# ─────────────────────────────────────────────────────────────────────────
+# Renders the four step-through pause pages.
+# Each page shows a Request panel (what's about to be sent) and a
+# Response panel (either "waiting…" or the actual response), then a
+# Continue button that POSTs to fire the real network call.
+# Extractable to step_renderer.py when the project grows.
+# ─────────────────────────────────────────────────────────────────────────
+
+class StepRenderer:
+    """HTML renderers for each step-through pause point."""
+
+    TOTAL_STEPS = 4
+
+    # ── Shared step-through CSS injected into each pause page ─────────────
+    _STEP_CSS = """
+    .step-header{display:flex;align-items:center;gap:1.2rem;margin-bottom:1.8rem}
+    .step-badge{font-family:monospace;font-size:0.72rem;color:#7a8298;
+                background:#1e2a3a;border:1px solid #252d3d;border-radius:4px;
+                padding:0.25rem 0.7rem;letter-spacing:0.08em;white-space:nowrap}
+    .step-progress{flex:1;height:3px;background:#1e2a3a;border-radius:2px;overflow:hidden}
+    .step-progress-fill{height:100%;border-radius:2px;
+                        background:linear-gradient(90deg,#3b7dd8,#00d4aa);
+                        transition:width 0.4s ease}
+    .panel{border-radius:8px;border:1px solid #252d3d;overflow:hidden;margin:0.8rem 0}
+    .panel-header{padding:0.5rem 1rem;font-family:monospace;font-size:0.72rem;
+                  letter-spacing:0.08em;text-transform:uppercase;
+                  display:flex;align-items:center;gap:0.5rem}
+    .panel-req .panel-header{background:#1a2a1a;border-bottom:1px solid #2a3a2a;color:#00d4aa}
+    .panel-res .panel-header{background:#1a1a2a;border-bottom:1px solid #252d3d;color:#3b7dd8}
+    .panel-body{padding:1rem 1.2rem;background:#0a0c10}
+    .panel-body pre{margin:0;font-size:0.78rem;line-height:1.7;
+                    white-space:pre-wrap;word-break:break-all}
+    .param-table{width:100%;border-collapse:collapse}
+    .param-table td{padding:0.28rem 0.6rem;font-size:0.8rem;
+                    border-bottom:1px solid #1a2035;vertical-align:top}
+    .param-table td:first-child{font-family:monospace;color:#00d4aa;
+                                white-space:nowrap;width:28%}
+    .param-table td:last-child{color:#c8d0e0;word-break:break-all}
+    .param-table .note{color:#4a5268;font-size:0.72rem;display:block;margin-top:0.15rem}
+    .waiting{color:#4a5268;font-family:monospace;font-size:0.82rem;
+             padding:1rem;font-style:italic}
+    .step-actions{display:flex;gap:1rem;align-items:center;margin-top:1.5rem;flex-wrap:wrap}
+    .skip-link{font-size:0.78rem;color:#4a5268;text-decoration:none;font-family:monospace}
+    .skip-link:hover{color:#7a8298}
+    .method-badge{display:inline-block;font-family:monospace;font-size:0.68rem;
+                  padding:0.1rem 0.45rem;border-radius:3px;font-weight:600;
+                  letter-spacing:0.05em;margin-right:0.4rem}
+    .get-badge{background:rgba(0,212,170,0.15);color:#00d4aa;border:1px solid #00d4aa}
+    .post-badge{background:rgba(59,125,216,0.15);color:#3b7dd8;border:1px solid #3b7dd8}
+    """
+
+    @staticmethod
+    def _step_page(title: str, step: int, body: str) -> str:
+        pct = int(step / StepRenderer.TOTAL_STEPS * 100)
+        header = f"""
+        <div class="step-header">
+          <div class="step-badge">Step {step} of {StepRenderer.TOTAL_STEPS}</div>
+          <div class="step-progress">
+            <div class="step-progress-fill" style="width:{pct}%"></div>
+          </div>
+        </div>"""
+        full_body = f"<style>{StepRenderer._STEP_CSS}</style>{header}{body}"
+        return _page(title, full_body)
+
+    @staticmethod
+    def _param_rows(params: dict, notes: dict | None = None) -> str:
+        notes = notes or {}
+        rows = ""
+        for k, v in params.items():
+            note = notes.get(k, "")
+            note_html = f'<span class="note">{html.escape(note)}</span>' if note else ""
+            rows += (f'<tr><td>{html.escape(k)}</td>'
+                     f'<td>{html.escape(str(v))}{note_html}</td></tr>')
+        return rows
+
+    # ── Step 1: Authorization request preview ─────────────────────────────
+
+    @staticmethod
+    def step1_authorize(state: str, auth_params: dict, auth_url: str) -> str:
+        notes = {
+            "client_id":             "Your app's identifier, registered with GitHub",
+            "response_type":         "We want an authorization code back, not a token",
+            "redirect_uri":          "Must match exactly what's registered in your OAuth App",
+            "scope":                 "Permissions being requested from the user",
+            "state":                 "Random CSRF token — verified when GitHub redirects back",
+            "code_challenge":        "SHA-256 hash of the code_verifier (PKCE S256)",
+            "code_challenge_method": "Tells GitHub which hash algorithm was used",
+        }
+        # Build the display params with response_type added
+        display_params = {"response_type": "code"} | auth_params
+
+        return StepRenderer._step_page("Step 1 — Authorization Request", 1, f"""
+<h1>Step 1 — Authorization Request</h1>
+<p class="label">About to redirect the browser to GitHub's Authorization Endpoint</p>
+
+<div class="card">
+  <h2>What's happening</h2>
+  <p style="font-size:0.88rem;line-height:1.65">
+    Your browser is about to be redirected to GitHub with the parameters below.
+    GitHub will authenticate the user and show a consent screen listing the
+    requested scopes. After approval, GitHub redirects back to
+    <code>{html.escape(REDIRECT_URI)}</code> with a short-lived authorization code.
+  </p>
+  <p style="font-size:0.85rem;line-height:1.65">
+    <strong>PKCE note:</strong> the <code>code_challenge</code> is sent now so
+    GitHub can bind the code to this specific request. The verifier stays on
+    the server — never sent to the browser.
+  </p>
+</div>
+
+<div class="panel panel-req">
+  <div class="panel-header">
+    <span class="method-badge get-badge">GET</span>
+    Request — Authorization Endpoint
+  </div>
+  <div class="panel-body">
+    <pre style="color:#00d4aa;margin-bottom:0.8rem">{html.escape(auth_url)}</pre>
+    <table class="param-table">
+      {StepRenderer._param_rows(display_params, notes)}
+    </table>
+  </div>
+</div>
+
+<div class="panel panel-res">
+  <div class="panel-header">Response — pending user action at GitHub</div>
+  <div class="panel-body">
+    <div class="waiting">
+      ⏳ GitHub will redirect back to /callback with an authorization code
+      and the original state token once the user approves…
+    </div>
+  </div>
+</div>
+
+<div class="step-actions">
+  <form method="POST" action="/step/redirect">
+    <input type="hidden" name="state" value="{html.escape(state)}">
+    <button class="btn btn-accent" type="submit">Send to GitHub →</button>
+  </form>
+  <a class="skip-link" href="/step/skip?state={html.escape(urllib.parse.quote(state))}">
+    Skip step-through and run full flow
+  </a>
+</div>
+""")
+
+    # ── Step 2: Callback received, preview token exchange ─────────────────
+
+    @staticmethod
+    def step2_exchange(state: str, auth_code: str, code_age: float,
+                       code_expired_locally: bool, verifier: str,
+                       challenge: str) -> str:
+        age_cls   = "err" if code_expired_locally else "ok"
+        age_label = f"{code_age:.1f} s"
+        exchange_params = {
+            "grant_type":    "authorization_code",
+            "code":          auth_code,
+            "redirect_uri":  REDIRECT_URI,
+            "client_id":     CLIENT_ID,
+            "code_verifier": verifier,
+        }
+        exchange_notes = {
+            "grant_type":    "RFC 6749 §4.1.3 — identifies this as a code exchange",
+            "code":          "The short-lived code just received from GitHub",
+            "redirect_uri":  "Must be identical to the one in the authorization request",
+            "client_id":     "Sent in body (GitHub's preference) or HTTP Basic Auth",
+            "code_verifier": "The original random string — GitHub re-derives the challenge to verify",
+        }
+        callback_params = {
+            "code":  auth_code,
+            "state": state,
+        }
+        callback_notes = {
+            "code":  "Single-use authorization code, expires in 600 s (GitHub hard limit)",
+            "state": "Matches the value we sent — CSRF check passed ✓",
+        }
+        expired_warn = (
+            f'<p class="err" style="font-size:0.85rem">⚠ Code age ({age_label}) exceeds '
+            f'CODE_MAX_AGE_SECONDS ({cfg.code_max_age} s). '
+            f'Continuing to demonstrate GitHub\'s own 600 s limit.</p>'
+            if code_expired_locally else ""
+        )
+
+        return StepRenderer._step_page("Step 2 — Token Exchange", 2, f"""
+<h1>Step 2 — Token Exchange</h1>
+<p class="label">GitHub redirected back with an authorization code — ready to exchange it</p>
+
+<div class="card">
+  <h2>Callback received</h2>
+  <p style="font-size:0.88rem;line-height:1.65">
+    GitHub redirected to <code>/callback</code> with the parameters below.
+    The state token has been verified (CSRF check passed). Now the server
+    will POST directly to GitHub's Token Endpoint — the browser is
+    not involved in this exchange.
+  </p>
+  <p style="font-size:0.88rem;line-height:1.65">
+    Code age: <span class="{age_cls}"><strong>{age_label}</strong></span>
+    (GitHub hard limit: 600 s · your guard: {cfg.code_max_age} s)
+  </p>
+  {expired_warn}
+</div>
+
+<div class="panel panel-res">
+  <div class="panel-header">
+    <span class="method-badge get-badge">GET</span>
+    Received — /callback from GitHub
+  </div>
+  <div class="panel-body">
+    <table class="param-table">
+      {StepRenderer._param_rows(callback_params, callback_notes)}
+    </table>
+  </div>
+</div>
+
+<div class="panel panel-req">
+  <div class="panel-header">
+    <span class="method-badge post-badge">POST</span>
+    About to send — Token Endpoint
+    <span style="color:#4a5268;font-size:0.75rem;margin-left:0.3rem">
+      {html.escape(TOKEN_URL)}
+    </span>
+  </div>
+  <div class="panel-body">
+    <p style="font-size:0.75rem;color:#4a5268;margin:0 0 0.7rem;font-family:monospace">
+      Auth: HTTP Basic ({html.escape(CLIENT_ID[:8])}… : &lt;secret&gt;) ·
+      Content-Type: application/x-www-form-urlencoded
+    </p>
+    <table class="param-table">
+      {StepRenderer._param_rows(exchange_params, exchange_notes)}
+    </table>
+  </div>
+</div>
+
+<div class="panel panel-res">
+  <div class="panel-header">Response — waiting for token</div>
+  <div class="panel-body">
+    <div class="waiting">⏳ GitHub will return an access_token, token_type, and scope…</div>
+  </div>
+</div>
+
+<div class="step-actions">
+  <form method="POST" action="/step/exchange">
+    <input type="hidden" name="state" value="{html.escape(state)}">
+    <button class="btn btn-accent" type="submit">Exchange Code for Token →</button>
+  </form>
+  <a class="skip-link" href="/step/skip?state={html.escape(urllib.parse.quote(state))}">
+    Skip step-through and complete flow
+  </a>
+</div>
+""")
+
+    # ── Step 3: Token received, preview resource server calls ─────────────
+
+    @staticmethod
+    def step3_userinfo(state: str, token_resp: dict) -> str:
+        access_token = token_resp.get("access_token", "")
+        token_type   = token_resp.get("token_type", "")
+        granted_scope = token_resp.get("scope", "")
+        requested_scopes = set(cfg.scopes.split())
+        granted_scopes   = set(granted_scope.split(",")) if granted_scope else set()
+        scope_rows = ""
+        for s in sorted(requested_scopes | granted_scopes):
+            req = "✓" if s in requested_scopes else "—"
+            grn = '<span class="ok">✓</span>' if s in granted_scopes else '<span class="err">✗</span>'
+            scope_rows += f"<tr><td><code>{html.escape(s)}</code></td><td>{req}</td><td>{grn}</td></tr>"
+
+        token_preview = access_token[:12] + "…" if access_token else "—"
+
+        return StepRenderer._step_page("Step 3 — Resource Server Calls", 3, f"""
+<h1>Step 3 — Resource Server Calls</h1>
+<p class="label">Token received — ready to call the GitHub API</p>
+
+<div class="card">
+  <h2>Token response</h2>
+  <p style="font-size:0.88rem;line-height:1.65">
+    The token exchange succeeded. The access token is an
+    <strong>opaque string</strong> — no expiry claim, no structure to decode,
+    no <code>exp</code> field. Identity must be confirmed by calling the API.
+    This is a key difference from OIDC, where a signed ID Token carries
+    identity claims that can be verified locally.
+  </p>
+  <table style="margin-top:0.8rem">
+    <tr><th>Field</th><th>Value</th><th>Note</th></tr>
+    <tr><td><code>access_token</code></td>
+        <td><code>{html.escape(token_preview)}</code></td>
+        <td>Opaque — begins <code>gho_</code>, no exp</td></tr>
+    <tr><td><code>token_type</code></td>
+        <td><code>{html.escape(token_type)}</code></td>
+        <td>Always <code>bearer</code> for GitHub</td></tr>
+    <tr><td><code>scope</code></td>
+        <td><code>{html.escape(granted_scope)}</code></td>
+        <td>Comma-separated (GitHub) vs space-separated (RFC 6749)</td></tr>
+  </table>
+
+  <h2 style="margin-top:1.2rem">Scope comparison</h2>
+  <table>
+    <tr><th>Scope</th><th>Requested</th><th>Granted</th></tr>
+    {scope_rows}
+  </table>
+</div>
+
+<div class="panel panel-req">
+  <div class="panel-header">
+    <span class="method-badge get-badge">GET</span>
+    About to send — Resource Server × 2
+  </div>
+  <div class="panel-body">
+    <table class="param-table">
+      <tr><td>GET {html.escape(USERINFO_URL)}</td>
+          <td>Authorization: Bearer {html.escape(token_preview)}
+            <span class="note">Returns public profile, login, avatar, bio…</span></td></tr>
+      <tr><td>GET {html.escape(EMAILS_URL)}</td>
+          <td>Authorization: Bearer {html.escape(token_preview)}
+            <span class="note">Returns verified email list (requires user:email scope)</span></td></tr>
+    </table>
+  </div>
+</div>
+
+<div class="panel panel-res">
+  <div class="panel-header">Response — waiting for /user and /user/emails</div>
+  <div class="panel-body">
+    <div class="waiting">⏳ GitHub API will return profile JSON and email list…</div>
+  </div>
+</div>
+
+<div class="step-actions">
+  <form method="POST" action="/step/userinfo">
+    <input type="hidden" name="state" value="{html.escape(state)}">
+    <button class="btn btn-accent" type="submit">Call Resource Server →</button>
+  </form>
+  <a class="skip-link" href="/step/skip?state={html.escape(urllib.parse.quote(state))}">
+    Skip to results
+  </a>
+</div>
+""")
+
 
 # ── PKCE helpers ──────────────────────────────────────────────────────────
 
@@ -496,6 +937,11 @@ def _home_page() -> str:
       <td>Show raw /user JSON</td>
       <td>{'<span class="ok">enabled</span>' if cfg.show_raw_json else '<span class="warn">disabled</span>'}</td>
       <td><code>SHOW_RAW_JSON</code></td>
+    </tr>
+    <tr>
+      <td>Step-through mode</td>
+      <td>{'<span class="ok">enabled</span> — flow will pause at each stage' if cfg.step_through else '<span class="muted">disabled</span>'}</td>
+      <td><code>STEP_THROUGH</code></td>
     </tr>
   </table>
   <p style="margin-top:0.8rem;font-size:0.78rem">
@@ -933,7 +1379,8 @@ def _config_page(saved: bool = False, reset: bool = False) -> str:
         saved_banner = ''
 
     sim_checked   = "checked" if cfg.simulate_id_token else ""
-    json_checked  = "checked" if cfg.show_raw_json else ""
+    json_checked  = "checked" if cfg.show_raw_json     else ""
+    step_checked  = "checked" if cfg.step_through      else ""
 
     return _page("Configuration", f"""
 <h1>Configuration</h1>
@@ -982,6 +1429,26 @@ def _config_page(saved: bool = False, reset: bool = False) -> str:
     <h2>Display Options</h2>
 
     <div class="field">
+      <div class="toggle-row">
+        <label class="toggle">
+          <input type="checkbox" name="step_through" {step_checked}>
+          <span class="toggle-slider"></span>
+        </label>
+        <div>
+          <div style="font-size:0.88rem">Step-through Mode
+            <span style="font-family:monospace;font-size:0.68rem;background:#1a2a44;
+                         border:1px solid #3b7dd8;color:#3b7dd8;padding:0.1rem 0.45rem;
+                         border-radius:3px;margin-left:0.4rem">DEMO</span>
+          </div>
+          <div class="hint">Pause the OAuth flow at each stage — authorization request,
+          callback, token exchange, and resource server calls — showing the exact
+          request and response at each step before proceeding.
+          Ideal for walkthroughs and presentations.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="field" style="margin-top:1.2rem">
       <div class="toggle-row">
         <label class="toggle">
           <input type="checkbox" name="simulate_id_token" {sim_checked}>
@@ -1062,6 +1529,8 @@ class OAuthHandler(BaseHTTPRequestHandler):
             self._handle_callback(params)
         elif path == "/config":
             self._send_html(_config_page())
+        elif path == "/step/skip":
+            self._handle_step_skip(params)
         else:
             self._send_html("<h1>404</h1>", 404)
 
@@ -1071,6 +1540,12 @@ class OAuthHandler(BaseHTTPRequestHandler):
             self._handle_revoke()
         elif parsed.path == "/config":
             self._handle_config()
+        elif parsed.path == "/step/redirect":
+            self._handle_step_redirect()
+        elif parsed.path == "/step/exchange":
+            self._handle_step_exchange()
+        elif parsed.path == "/step/userinfo":
+            self._handle_step_userinfo()
         else:
             self._send_html("<h1>404</h1>", 404)
 
@@ -1098,6 +1573,7 @@ class OAuthHandler(BaseHTTPRequestHandler):
             code_max_age      = int(params.get("code_max_age", ["600"])[0]),
             simulate_id_token = "simulate_id_token" in params,
             show_raw_json     = "show_raw_json"     in params,
+            step_through      = "step_through"      in params,
         )
 
         print(f"[⚙] {cfg!r}")
@@ -1146,7 +1622,7 @@ class OAuthHandler(BaseHTTPRequestHandler):
         verifier, challenge = generate_pkce_pair()
         session_store.create(state, verifier, challenge)
 
-        params = {
+        auth_params = {
             "client_id":             CLIENT_ID,
             "redirect_uri":          REDIRECT_URI,
             "scope":                 cfg.scopes,
@@ -1154,9 +1630,164 @@ class OAuthHandler(BaseHTTPRequestHandler):
             "code_challenge":        challenge,
             "code_challenge_method": "S256",
         }
-        auth_url = AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
-        print(f"\n[→] Redirecting to GitHub:\n    {auth_url}\n")
-        self._redirect(auth_url)
+        auth_url = AUTHORIZE_URL + "?" + urllib.parse.urlencode(auth_params)
+
+        if cfg.step_through:
+            # Pause at Step 1 — show the authorization request before firing it
+            flow_store.start(state, verifier, challenge, auth_url, auth_params)
+            print(f"\n[⏸] Step-through mode: pausing before authorization redirect")
+            self._send_html(StepRenderer.step1_authorize(state, auth_params, auth_url))
+        else:
+            print(f"\n[→] Redirecting to GitHub:\n    {auth_url}\n")
+            self._redirect(auth_url)
+
+    # ── Step-through handlers ─────────────────────────────────────────────
+
+    def _read_post_params(self) -> dict:
+        """Read and parse a URL-encoded POST body."""
+        length = int(self.headers.get("Content-Length", 0))
+        raw    = self.rfile.read(length).decode()
+        return urllib.parse.parse_qs(raw, keep_blank_values=True)
+
+    def _handle_step_redirect(self):
+        """Step 1 → fire the actual GitHub redirect."""
+        params = self._read_post_params()
+        state  = params.get("state", [""])[0]
+        if not flow_store.active or flow_store.state != state:
+            self._send_html('<p class="err">Step-through session expired. '
+                            '<a href="/">Start over</a></p>', 400)
+            return
+        print(f"\n[→] Step-through: redirecting to GitHub\n    {flow_store.auth_url}\n")
+        self._redirect(flow_store.auth_url)
+
+    def _handle_step_exchange(self):
+        """Step 2 → fire the token exchange POST."""
+        params = self._read_post_params()
+        state  = params.get("state", [""])[0]
+        if not flow_store.active or flow_store.state != state:
+            self._send_html('<p class="err">Step-through session expired. '
+                            '<a href="/">Start over</a></p>', 400)
+            return
+
+        print("[↔] Step-through: exchanging code for token…")
+        try:
+            token_resp = _post_form(TOKEN_URL, {
+                "client_id":     CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "code":          flow_store.auth_code,
+                "redirect_uri":  REDIRECT_URI,
+                "code_verifier": flow_store.verifier,
+            })
+        except Exception as exc:
+            self._send_html(
+                f'<pre style="color:#e05c5c">Token exchange failed: {html.escape(str(exc))}</pre>',
+                500,
+            )
+            return
+
+        access_token = token_resp.get("access_token", "")
+        if not access_token:
+            self._send_html(
+                f'<pre style="color:#e05c5c">No access_token:\n'
+                f'{html.escape(json.dumps(token_resp, indent=2))}</pre>',
+                400,
+            )
+            return
+
+        flow_store.save_token(token_resp)
+        self._send_html(StepRenderer.step3_userinfo(state, token_resp))
+
+    def _handle_step_userinfo(self):
+        """Step 3 → fire the /user and /user/emails calls then show results."""
+        params = self._read_post_params()
+        state  = params.get("state", [""])[0]
+        if not flow_store.active or flow_store.state != state:
+            self._send_html('<p class="err">Step-through session expired. '
+                            '<a href="/">Start over</a></p>', 400)
+            return
+
+        access_token = flow_store.token_resp.get("access_token", "")
+        print("[→] Step-through: fetching /user and /user/emails…")
+        try:
+            user   = _get(USERINFO_URL, access_token)
+            emails = _get(EMAILS_URL,   access_token)
+        except Exception as exc:
+            self._send_html(
+                f'<pre style="color:#e05c5c">Resource Server error: {html.escape(str(exc))}</pre>',
+                500,
+            )
+            return
+
+        print(f"[✓] Authenticated as: {user.get('login')}  "
+              f"(code age: {flow_store.code_age:.1f} s)")
+        token_store.save(access_token, user.get("login", ""))
+
+        # Reconstruct the full results page arguments from flow_store
+        result_html = _callback_page(
+            flow_store.auth_code, flow_store.state, flow_store.token_resp,
+            user, emails, flow_store.auth_url,
+            flow_store.verifier, flow_store.challenge,
+            flow_store.code_age, flow_store.code_expired_locally,
+        )
+        flow_store.clear()
+        self._send_html(result_html)
+
+    def _handle_step_skip(self, params: dict):
+        """Abandon step-through and run the remaining flow immediately."""
+        state = urllib.parse.unquote(params.get("state", ""))
+        if not flow_store.active or flow_store.state != state:
+            self._redirect("/")
+            return
+
+        # If we haven't yet got a token, we need to exchange and fetch
+        if not flow_store.token_resp:
+            if not flow_store.auth_code:
+                # Haven't even got the callback yet — just redirect normally
+                flow_store.clear()
+                self._redirect(flow_store.auth_url if flow_store.auth_url else "/")
+                return
+            # Exchange code
+            try:
+                token_resp = _post_form(TOKEN_URL, {
+                    "client_id":     CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "code":          flow_store.auth_code,
+                    "redirect_uri":  REDIRECT_URI,
+                    "code_verifier": flow_store.verifier,
+                })
+            except Exception as exc:
+                self._send_html(
+                    f'<pre style="color:#e05c5c">Token exchange failed: {html.escape(str(exc))}</pre>',
+                    500,
+                )
+                return
+            flow_store.save_token(token_resp)
+
+        access_token = flow_store.token_resp.get("access_token", "")
+        if not access_token:
+            flow_store.clear()
+            self._redirect("/")
+            return
+
+        try:
+            user   = _get(USERINFO_URL, access_token)
+            emails = _get(EMAILS_URL,   access_token)
+        except Exception as exc:
+            self._send_html(
+                f'<pre style="color:#e05c5c">Resource Server error: {html.escape(str(exc))}</pre>',
+                500,
+            )
+            return
+
+        token_store.save(access_token, user.get("login", ""))
+        result_html = _callback_page(
+            flow_store.auth_code, flow_store.state, flow_store.token_resp,
+            user, emails, flow_store.auth_url,
+            flow_store.verifier, flow_store.challenge,
+            flow_store.code_age, flow_store.code_expired_locally,
+        )
+        flow_store.clear()
+        self._send_html(result_html)
 
     def _handle_callback(self, params: dict):
         # ── CSRF check ────────────────────────────────────────────────────
@@ -1202,7 +1833,17 @@ class OAuthHandler(BaseHTTPRequestHandler):
             "code_challenge_method": "S256",
         })
 
-        # ── Token exchange ────────────────────────────────────────────────
+        # ── Step-through: pause before token exchange ─────────────────────
+        if cfg.step_through and flow_store.active and flow_store.state == state:
+            flow_store.save_callback(auth_code, code_age, code_expired_locally)
+            print(f"[⏸] Step-through: pausing before token exchange "
+                  f"(code age: {code_age:.1f} s)")
+            self._send_html(StepRenderer.step2_exchange(
+                state, auth_code, code_age, code_expired_locally, verifier, challenge,
+            ))
+            return
+
+        # ── Normal (non-step-through) flow ────────────────────────────────
         print("[↔] Exchanging code for token…")
         try:
             token_resp = _post_form(TOKEN_URL, {
